@@ -14,9 +14,12 @@ from dataclasses import dataclass
 import pandas as pd
 
 from ..factor.split import oos_cutoff
+from ..journal import Journal
 from ..search.loop import Gates, run_search
 from .oos import evaluate_oos, verdict
 from .stats import bonferroni, deflated_sharpe
+
+_journal = Journal(path="journal/events.jsonl")
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,7 @@ def run_gate(strategy, bars_by_symbol, close, *, horizon=5, min_names=10,
              oos_frac=0.25, rounds=4, icir_floor=0.3, half_life_floor=5,
              alpha=0.05, dsr_threshold=0.95) -> GateResult:
     cutoff = oos_cutoff(close.index, oos_frac)
+    _journal.record("loop_start", strategy=strategy)
     close_is = close.loc[close.index < cutoff]
 
     search = run_search(
@@ -83,5 +87,15 @@ def run_gate(strategy, bars_by_symbol, close, *, horizon=5, min_names=10,
             s.params, s.icir, ev["oos_icir"], ev["oos_half_life"],
             bonf_p, bonf_thr, bonf_pass, dsr, dsr_pass, viable, reason,
         ))
+        _journal.record(
+            "score", strategy=strategy, params=s.params, is_icir=float(s.icir),
+            oos_icir=float(ev["oos_icir"]), bonf_p=float(bonf_p),
+            bonf_pass=bool(bonf_pass), dsr=float(dsr), dsr_pass=bool(dsr_pass),
+            viable=bool(viable), reason=reason,
+        )
 
+    _journal.record(
+        "loop_end", strategy=strategy, n_tested=search.n_tested,
+        n_viable=len([r for r in rows if r.viable]),
+    )
     return GateResult(strategy, search.n_tested, rows, [r for r in rows if r.viable])

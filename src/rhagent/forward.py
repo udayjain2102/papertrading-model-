@@ -28,6 +28,9 @@ import pandas as pd
 from .backtest import net_returns
 from .config import load
 from .data import get_bars
+from .journal import Journal
+
+_journal = Journal(path="journal/events.jsonl")
 
 
 def _agent_positions(eval_dir: Path, symbol: str, bars: pd.DataFrame,
@@ -53,7 +56,13 @@ def _agent_positions(eval_dir: Path, symbol: str, bars: pd.DataFrame,
             pos = decided[ts]
             continue
         history = bars.loc[:ts]
-        pos = agent.decide(symbol, history, pos).target
+        prev_pos = pos
+        decision = agent.decide(symbol, history, pos)
+        pos = decision.target
+        _journal.record("decision", symbol=symbol,
+                        date=str(ts.date()) if hasattr(ts, "date") else str(ts),
+                        prev_pos=prev_pos, target_pos=pos,
+                        reason=decision.reason, source="agent")
         decided[ts] = pos
     out = pd.Series(decided).reindex(bars.index).astype(float)
     out.rename_axis("date").rename("pos").to_csv(cache)
@@ -121,6 +130,7 @@ def tick(cfg, eval_dir: Path, cost_bps: float = 1.0, *, engine: str | None = Non
     """Append newly-realized days to eval_dir/returns.csv. Returns the meta dict."""
     eval_dir.mkdir(parents=True, exist_ok=True)
     engine = engine or cfg.strategy.name
+    _journal.record("loop_start", run_id=eval_dir.name, engine=engine)
     today = today or date.today()
     start = (today - timedelta(days=400)).isoformat()
     bars = get_bars(cfg.strategy.universe, start, today.isoformat(), fetch=fetch,
@@ -139,6 +149,9 @@ def tick(cfg, eval_dir: Path, cost_bps: float = 1.0, *, engine: str | None = Non
         new = net.tail(1)
 
     rows = pd.DataFrame({"date": new.index, "net": new.values})
+    for d, net_return in new.items():
+        _journal.record("tick_result", date=str(d), net_return=float(net_return),
+                        run_id=eval_dir.name)
     combined = pd.concat([prev, rows], ignore_index=True).drop_duplicates("date")
     combined = combined.sort_values("date")
     combined.to_csv(ret_path, index=False)
@@ -154,6 +167,8 @@ def tick(cfg, eval_dir: Path, cost_bps: float = 1.0, *, engine: str | None = Non
     }
     (eval_dir / "run.json").write_text(json.dumps(meta, indent=2, sort_keys=True))
     (eval_dir / "trades.jsonl").touch()  # evaluate.load_run expects the file
+    _journal.record("loop_end", run_id=eval_dir.name, engine=engine,
+                    appended=len(rows), total_days=len(combined))
     return {"meta": meta, "appended": len(rows), "total_days": len(combined)}
 
 

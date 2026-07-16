@@ -16,8 +16,10 @@ reuses rhagent.evaluate so the numbers match the CLI report exactly.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import webbrowser
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 
@@ -53,6 +55,111 @@ def _money(x: float) -> str:
 
 def _num(x: float) -> str:
     return "∞" if x == float("inf") else f"{x:.2f}"
+
+
+# ── live event log ──────────────────────────────────────────────────────────
+
+def _read_events(path: Path, limit: int = 200) -> list[dict]:
+    """Last `limit` lines of an events.jsonl, newest first. Missing/malformed-safe."""
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+    events = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    events.reverse()
+    return events
+
+
+def _event_age_label(ts: str) -> tuple[str, str]:
+    """(label, css class) for how long ago an ISO-8601 timestamp was."""
+    try:
+        when = datetime.fromisoformat(ts)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - when).total_seconds()
+    except (TypeError, ValueError):
+        return "unknown", "bad"
+    if age < 120:
+        return f"{int(age)}s ago", "ok"
+    if age < 900:
+        return f"{int(age // 60)}m ago", "warn"
+    if age < 3600:
+        return f"{int(age // 60)}m ago", "bad"
+    if age < 86400:
+        return f"{age / 3600:.1f}h ago", "bad"
+    return f"{age / 86400:.1f}d ago", "bad"
+
+
+def _live_status_bar(events: list[dict]) -> str:
+    if not events:
+        return "<div class='tiles'><div class='tile'><div class='muted'>no live events yet</div></div></div>"
+    latest = events[0]
+    label, cls = _event_age_label(str(latest.get("ts", "")))
+    phase = str(latest.get("event", "unknown"))
+    return (
+        "<div class='tiles'>"
+        f"<div class='tile'><div class='tile-v {cls}'>{escape(label)}</div>"
+        "<div class='tile-l'>last event</div></div>"
+        f"<div class='tile'><div class='tile-v'>{escape(phase)}</div>"
+        "<div class='tile-l'>current phase</div></div>"
+        "</div>"
+    )
+
+
+def _live_feed_table(events: list[dict]) -> str:
+    if not events:
+        return "<p class='muted'>no live events yet</p>"
+    rows = []
+    for e in events:
+        ts = str(e.get("ts", ""))
+        time_str = ts[11:19] if len(ts) >= 19 else ts
+        detail = ", ".join(f"{k}={v}" for k, v in e.items() if k not in ("ts", "event"))
+        if len(detail) > 120:
+            detail = detail[:117] + "..."
+        rows.append(
+            f"<tr><td class='mono'>{escape(time_str)}</td>"
+            f"<td>{escape(str(e.get('event', '')))}</td>"
+            f"<td class='reason'>{escape(detail)}</td></tr>"
+        )
+    return (
+        "<table class='grid'><thead><tr><th>time</th><th>event</th><th>detail</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def _scoring_board(events: list[dict]) -> str:
+    scores = [e for e in events if e.get("event") == "score"]
+    if not scores:
+        return "<p class='muted'>no scoring events yet</p>"
+    scores.sort(key=lambda e: bool(e.get("viable")), reverse=True)
+    n_viable = sum(1 for e in scores if e.get("viable"))
+    rows = []
+    for e in scores:
+        viable = bool(e.get("viable"))
+        pill = "win" if viable else "loss"
+        rows.append(
+            f"<tr><td>{escape(str(e.get('strategy', '')))}</td>"
+            f"<td class='mono'>{escape(str(e.get('params', '')))}</td>"
+            f"<td class='num'>{escape(str(e.get('is_icir', '')))}</td>"
+            f"<td class='num'>{escape(str(e.get('oos_icir', '')))}</td>"
+            f"<td class='num'>{escape(str(e.get('bonf_p', '')))}</td>"
+            f"<td class='num'>{escape(str(e.get('dsr', '')))}</td>"
+            f"<td><span class='pill {pill}'>{'yes' if viable else 'no'}</span></td>"
+            f"<td class='reason'>{escape(str(e.get('reason', '')))}</td></tr>"
+        )
+    table = (
+        "<table class='grid'><thead><tr><th>strategy</th><th>params</th>"
+        "<th>is icir</th><th>oos icir</th><th>bonf p</th><th>dsr</th>"
+        f"<th>viable</th><th>reason</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"
+    )
+    return f"<p class='sub'>scored {len(scores)} · viable {n_viable}</p>{table}"
 
 
 # ── SVG equity curve ────────────────────────────────────────────────────────
@@ -414,11 +521,11 @@ def _run_section(run_dir: Path, anchored: bool = False) -> str:
   </section>"""
 
 
-def _page(title: str, body: str, footer: str) -> str:
+def _page(title: str, body: str, footer: str, extra_head: str = "") -> str:
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{escape(title)}</title>
-<style>{_CSS}</style></head><body><div class="wrap">
+{extra_head}<style>{_CSS}</style></head><body><div class="wrap">
   <h1>Paper-Trade Dashboard</h1>
   {body}
   <footer>{footer}</footer>
@@ -439,7 +546,7 @@ def render(run_dir: Path, base_dir: Path) -> str:
     )
 
 
-def render_all(base_dir: Path) -> str:
+def render_all(base_dir: Path, live: bool = False) -> str:
     """Index of every run (newest first) plus each run's full detail below."""
     runs = sorted(
         (p.parent for p in base_dir.glob("*/run.json")), reverse=True
@@ -447,7 +554,20 @@ def render_all(base_dir: Path) -> str:
     if not runs:
         raise SystemExit(f"no runs found under {base_dir} — run rhagent.papertrade first")
     comparison = compare_runs(base_dir)
-    index = (
+    index = ""
+    extra_head = ""
+    if live:
+        events = _read_events(base_dir.parent / "events.jsonl")
+        index += (
+            "<h2>Live now</h2>"
+            + _live_status_bar(events)
+            + "<h2>Live feed</h2>"
+            + f"<div class='tblscroll'>{_live_feed_table(events)}</div>"
+            + "<h2>Scoring board</h2>"
+            + f"<div class='tblscroll'>{_scoring_board(events)}</div>"
+        )
+        extra_head = '<meta http-equiv="refresh" content="5">\n'
+    index += (
         # Drill-down via native CSS :target — hide every run's detail until its
         # id is clicked, so 1000+-row ledgers don't all render at once.
         "<style>.runcard{display:none}.runcard:target{display:block}</style>"
@@ -467,6 +587,7 @@ def render_all(base_dir: Path) -> str:
     return _page(
         f"Paper-trade dashboard — {len(runs)} runs", index + sections,
         f"Generated from {escape(str(base_dir))} · rhagent paper-trade harness",
+        extra_head=extra_head,
     )
 
 
@@ -476,9 +597,33 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--base-dir", default="journal/papertrade")
     p.add_argument("--out", help="output HTML path (default: <base-dir>/dashboard.html)")
     p.add_argument("--open", action="store_true", help="open the dashboard in a browser")
+    p.add_argument("--live", action="store_true",
+                    help="prepend a live 'now' section from journal/events.jsonl, auto-refresh every 5s")
+    p.add_argument("--watch", action="store_true",
+                    help="regenerate (implies --live) whenever journal/events.jsonl changes; Ctrl-C to stop")
     args = p.parse_args(argv)
 
     base_dir = Path(args.base_dir)
+    out = Path(args.out) if args.out else base_dir / "dashboard.html"
+
+    if args.watch:
+        import time
+
+        events_path = base_dir.parent / "events.jsonl"
+        last_mtime = None
+        print(f"watching {events_path} -> {out} (Ctrl-C to stop)")
+        try:
+            while True:
+                mtime = events_path.stat().st_mtime if events_path.exists() else None
+                if mtime != last_mtime:
+                    out.write_text(render_all(base_dir, live=True), encoding="utf-8")
+                    print(f"wrote {out}")
+                    last_mtime = mtime
+                time.sleep(3)
+        except KeyboardInterrupt:
+            print("stopped")
+        return 0
+
     if args.run:
         run_dir = base_dir / args.run
         if not (run_dir / "run.json").exists():
@@ -486,10 +631,9 @@ def main(argv: list[str] | None = None) -> int:
         html = render(run_dir, base_dir)
         label = run_dir.name
     else:
-        html = render_all(base_dir)
+        html = render_all(base_dir, live=args.live)
         label = "all runs"
 
-    out = Path(args.out) if args.out else base_dir / "dashboard.html"
     out.write_text(html, encoding="utf-8")
     print(f"wrote {out}  ({label})")
     if args.open:
