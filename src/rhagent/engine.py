@@ -67,6 +67,14 @@ class Decision:
     target: float  # desired position in {-1, 0, +1}
     reason: str    # human-readable why
     conviction: float | None = None  # per-bar signal strength, if the strategy has one
+    # "ok": a genuine model/strategy verdict. "failed": decide() couldn't get
+    # one (parse failure, timeout, rate limit, API error) and fell back to
+    # holding current_pos. Default "ok" so every non-agent caller (and every
+    # pre-existing positional/keyword construction) is unaffected; only
+    # AgentEngine's except branch sets "failed". Consumers that compute
+    # agent performance/hit-rate should filter on status == "ok" -- a failed
+    # tick is not a trading decision, just a forced hold.
+    status: str = "ok"
 
 
 class DecisionEngine(Protocol):
@@ -154,9 +162,10 @@ class AgentEngine:
             f"last_close={last:.2f} momentum_5d={mom5:+.4f} "
             f"vol_20d={vol20:.4f} current_pos={current_pos:+.0f}\n"
             f"{lessons}"
-            'Reply with STRICT JSON only: {"target": -1 | 0 | 1, '
-            '"reason": "<=15 words"} where target is the desired position '
-            "(-1 short, 0 flat, 1 long)."
+            "Respond with ONLY this JSON object and nothing else -- no "
+            "reasoning, no markdown fences, no text before or after it: "
+            '{"target": -1 | 0 | 1, "reason": "<=15 words"} where target is '
+            "the desired position (-1 short, 0 flat, 1 long)."
         )
 
     def _call_model(self, prompt: str) -> str:
@@ -197,9 +206,21 @@ class AgentEngine:
         if self.complete is None:
             self.complete = self._default_complete()
         prompt = self._prompt(symbol, history, current_pos)
+        status = "ok"
         try:
             raw = self._call_model(prompt)
-            obj = json.loads(re.search(r"\{.*\}", raw, re.DOTALL).group(0))
+            # re.search(...).group(0) used to crash with AttributeError
+            # whenever the model answered in prose with no {...} at all
+            # (nemotron's chain-of-thought sometimes leaks past "detailed
+            # thinking off" and eats the token budget before it reaches
+            # JSON) -- that was 46/130 recorded "decisions" in production.
+            # Guard it explicitly and keep a snippet of the raw reply so the
+            # log says what the model actually sent, not just that .group()
+            # blew up on None.
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match is None:
+                raise ValueError(f"no JSON object in reply: {raw!r}")
+            obj = json.loads(match.group(0))
             target = float(int(obj["target"]))
             if target not in (-1.0, 0.0, 1.0):
                 raise ValueError("target out of range")
@@ -207,10 +228,11 @@ class AgentEngine:
                 target = 0.0
             reason = str(obj.get("reason", ""))
         except Exception as e:
+            status = "failed"
             target = float(current_pos)
             # Distinguish failure classes so decisions.jsonl says what actually
             # happened instead of collapsing everything into "parse-fail".
-            if isinstance(e, (json.JSONDecodeError, KeyError, ValueError, AttributeError)):
+            if isinstance(e, (json.JSONDecodeError, KeyError, ValueError)):
                 reason = f"parse-fail: {type(e).__name__}: {e}"
             elif isinstance(e, RateLimitError):
                 reason = f"rate-limited: {e}"
@@ -221,4 +243,4 @@ class AgentEngine:
             else:
                 reason = f"error: {type(e).__name__}: {e}"
             reason = reason[:180]
-        return Decision(target=target, reason=f"agent: {reason}")
+        return Decision(target=target, reason=f"agent: {reason}", status=status)
