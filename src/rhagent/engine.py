@@ -23,13 +23,14 @@ _MIN_CALL_INTERVAL = 4.0  # seconds; NVIDIA's ~18 req/min bucket -- pace under i
 _RATE_LIMIT_RETRIES = 3   # extra attempts after a 429, each with doubling backoff
 
 
-def nvidia_complete(max_tokens: int = 256, model: str = "") -> Callable[[str], str]:
+def nvidia_complete(max_tokens: int | None = None, model: str = "") -> Callable[[str], str]:
     """Build an NVIDIA OpenAI-compatible `complete(prompt) -> text` callable.
 
     Shared client-building seam: AgentEngine's decision calls and memory.reflect's
     reflection call both need "detailed thinking off" + a token cap to keep
     nemotron-super's chain-of-thought from ballooning latency (see AgentEngine
-    docstring for why).
+    docstring for why). max_tokens=None (like model="") defers to cfg.agent so
+    config.yaml's value actually reaches the API call instead of a hardcoded default.
     """
     from openai import OpenAI
 
@@ -46,6 +47,7 @@ def nvidia_complete(max_tokens: int = 256, model: str = "") -> Callable[[str], s
         timeout=45, max_retries=0,
     )
     model = model or cfg.agent.model
+    max_tokens = max_tokens or cfg.agent.max_tokens
 
     def complete(prompt: str) -> str:
         resp = client.chat.completions.create(
@@ -114,7 +116,7 @@ class AgentEngine:
         lessons: str = "",
         name: str = "agent",
         allow_short: bool = False,
-        max_tokens: int = 256,
+        max_tokens: int | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.complete = complete
@@ -132,8 +134,9 @@ class AgentEngine:
         One bar-decision is a two-field JSON, not an essay. nemotron-super is a
         hybrid reasoning model that dumps a long chain-of-thought by default
         (60-120s/call at cfg.agent.max_tokens=16000); the "detailed thinking
-        off" system directive plus a small token cap keeps each call ~2s while
-        still returning a reasoned verdict.
+        off" system directive plus a token cap keeps each call bounded while
+        still returning a reasoned verdict. self.max_tokens=None (the default)
+        defers to cfg.agent.max_tokens rather than silently capping lower.
         """
         return nvidia_complete(max_tokens=self.max_tokens, model=self.model)
 
@@ -199,7 +202,14 @@ class AgentEngine:
         prompt = self._prompt(symbol, history, current_pos)
         try:
             raw = self._call_model(prompt)
-            obj = json.loads(re.search(r"\{.*\}", raw, re.DOTALL).group(0))
+            # findall + last match, not a single greedy search: a reasoning model's
+            # chain-of-thought can echo the prompt's own example braces before the
+            # real answer, and a first-{-to-last-} greedy span would swallow the
+            # prose between them and fail json.loads.
+            matches = re.findall(r"\{[^{}]*\}", raw, re.DOTALL)
+            if not matches:
+                raise ValueError(f"no JSON object in model reply: {raw[:120]!r}")
+            obj = json.loads(matches[-1])
             target = float(int(obj["target"]))
             if target not in (-1.0, 0.0, 1.0):
                 raise ValueError("target out of range")
