@@ -47,9 +47,12 @@ def test_parse_fail_holds_current_pos():
 
 def test_default_complete_uses_configured_max_tokens(monkeypatch):
     """AgentEngine() with no explicit max_tokens must reach the API with
-    cfg.agent.max_tokens (config.yaml has 16000) -- not a hardcoded default
-    that silently ignores config.yaml."""
+    cfg.agent.max_tokens -- not a hardcoded default that silently ignores
+    config.yaml. Asserts against the live config value, not a literal, so
+    retuning the budget doesn't break the test that guards the wiring."""
     import openai
+
+    from rhagent.config import load
 
     captured = {}
 
@@ -69,7 +72,7 @@ def test_default_complete_uses_configured_max_tokens(monkeypatch):
     d = AgentEngine().decide("X", hist, 0.0)  # complete=None -> lazy nvidia client
 
     assert d.target == 1.0
-    assert captured["max_tokens"] == 16000  # from config.yaml, not a hardcoded 256
+    assert captured["max_tokens"] == load().agent.max_tokens  # not a hardcoded 256
 
 
 def test_json_extraction_prefers_last_brace_span():

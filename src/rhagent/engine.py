@@ -122,10 +122,11 @@ class AgentEngine:
 
         One bar-decision is a two-field JSON, not an essay. nemotron-super is a
         hybrid reasoning model that dumps a long chain-of-thought by default
-        (60-120s/call at cfg.agent.max_tokens=16000); the "detailed thinking
-        off" system directive plus a token cap keeps each call bounded while
-        still returning a reasoned verdict. self.max_tokens=None (the default)
-        defers to cfg.agent.max_tokens rather than silently capping lower.
+        (60-120s/call at a 16000-token budget); the "detailed thinking off"
+        system directive plus a token cap keeps each call bounded while still
+        returning a reasoned verdict. self.max_tokens=None (the default) defers
+        to cfg.agent.max_tokens rather than silently capping lower -- tune the
+        budget there, not here.
         """
         return nvidia_complete(max_tokens=self.max_tokens, model=self.model)
 
